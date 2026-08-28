@@ -176,10 +176,10 @@ install it was built against. Everyone builds from source. The same is true of
 
 * **Binary Ninja, Commercial or Ultimate.** Headless operation is not available
   on Personal. Developed and tested against **5.3.9757**.
-* **Rust 1.95 or newer** — the MSRV comes from `vibrev-kit`, not from the
-  Binary Ninja API (whose own is 1.91.1). This crate stays edition 2021.
+* **Rust 1.95 or newer.**
 * **clang** — `binaryninjacore-sys` runs bindgen.
-* **git** — the API is fetched as a git dependency, ~100 MB of clone plus
+* **git** — the Binary Ninja API and the `vibrev` crates are both fetched as
+  git dependencies, pinned to revisions. The API clone is ~100 MB plus
   submodules on first build.
 
 ### Build
