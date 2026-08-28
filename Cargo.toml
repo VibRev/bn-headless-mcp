@@ -1,0 +1,77 @@
+[package]
+name = "bn-headless-mcp"
+version = "0.0.1"
+# Edition and MSRV are two separate decisions, and they no longer have the same
+# reason behind them.
+#
+# Edition 2021, not the workspace default of 2024, because `binaryninja` is
+# edition 2021 and this engine is written against its API. Nothing here needs a
+# 2024-only construct, and code in this crate was written knowing let-chains are
+# not available — raising the edition is a real edit, not a one-line bump.
+#
+# MSRV 1.95 because `vibrev-kit` declares it (../vibrev/Cargo.toml). Cargo
+# checks every package in the graph against the active toolchain, so the 1.91.1
+# this line used to carry — the API's own MSRV — had already been voided by
+# transitivity: no toolchain below 1.95 could resolve this build at all. It went
+# unnoticed for as long as the development machine's rustc happened to be
+# exactly 1.95.0. Moving to 1.98.0 is what surfaced it.
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "Binary Ninja as a complete MCP server, with a CLI derived from the same tool definitions"
+
+[dependencies]
+# Binary Ninja's Rust API is not on crates.io, has no `stable` branch, and has
+# already broken us three times (README "Version pinning"). The revision below is
+# the one `api_REVISION.txt` names inside the 5.3.9757 install — pinning that,
+# rather than a tag or a branch, is the only way the API we compile against and
+# the core we link against come from the same commit.
+#
+# `binaryninjacore-sys` has to be a *direct* dependency: its build script is what
+# publishes `DEP_BINARYNINJACORE_PATH`, and cargo only forwards `links` metadata
+# to direct dependents. Our `build.rs` consumes it.
+binaryninja = { git = "https://github.com/Vector35/binaryninja-api.git", rev = "aa25bfcfd36532ec3850558a58444df7727e297b" }
+binaryninjacore-sys = { git = "https://github.com/Vector35/binaryninja-api.git", rev = "aa25bfcfd36532ec3850558a58444df7727e297b" }
+
+# `http` for `serve --mode http`, which is what a bare invocation does: the
+# listener — bind, token, Origin/Host, the banner, graceful shutdown — is the
+# kit's, and is the same code `ida-headless-mcp` runs.
+vibrev-kit = { path = "../vibrev/crates/vibrev-kit", features = ["http"] }
+vibrev-tool-macros = { path = "../vibrev/crates/vibrev-tool-macros" }
+
+rmcp = { version = "3.1.2", features = [
+    "server",
+    "client",
+    "macros",
+    "transport-io",
+    "transport-child-process",
+    "transport-streamable-http-server",
+    "schemars",
+] }
+# Only for the router the HTTP transport hands to
+# `vibrev_kit::transport::Listener`. The listener itself, and the gate over
+# every route on it, are the kit's.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+] }
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+# Deliberately *not* `preserve_order`: cargo unifies features across the whole
+# graph, so turning it on here would reorder the keys of every JSON payload any
+# crate in this build emits.
+serde_json = "1"
+clap = { version = "4.6", features = ["derive", "string"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "net", "process", "signal", "sync", "time"] }
+# `CancellationToken`, and only that. `vibrev_kit::tasks` registers one per
+# background task and the registry deliberately keeps no `JoinHandle` — aborting
+# a tokio task cannot interrupt a thread parked inside Binary Ninja's core, so
+# cancellation is cooperative and the token is the whole mechanism.
+tokio-util = "0.7"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+debug = 1
