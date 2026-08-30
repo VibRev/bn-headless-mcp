@@ -37,10 +37,10 @@ binaryninjacore-sys = { git = "https://github.com/Vector35/binaryninja-api.git",
 #     [patch."https://github.com/VibRev/vibrev.git"]
 #     vibrev-kit = { path = "../vibrev/crates/vibrev-kit" }
 #     vibrev-tool-macros = { path = "../vibrev/crates/vibrev-tool-macros" }
-vibrev-kit = { git = "https://github.com/VibRev/vibrev.git", rev = "7aff0cc5331256a8799e20c55eab64fc7e359348", features = [
+vibrev-kit = { git = "https://github.com/VibRev/vibrev.git", rev = "f008faa", features = [
     "http",
 ] }
-vibrev-tool-macros = { git = "https://github.com/VibRev/vibrev.git", rev = "7aff0cc5331256a8799e20c55eab64fc7e359348" }
+vibrev-tool-macros = { git = "https://github.com/VibRev/vibrev.git", rev = "f008faa" }
 
 rmcp = { version = "3.1.2", features = [
     "server",

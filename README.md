@@ -217,13 +217,13 @@ and it speaks **HTTP unless you ask for stdio**.
 
 ```bash
 bn-headless-mcp                                    # serve, HTTP, 127.0.0.1:8765
-bn-headless-mcp serve --mode http --allow-origin http://localhost
+bn-headless-mcp serve --mode http
 bn-headless-mcp serve --mode stdio                 # your client spawns this
 ```
 
 **HTTP** is one route, `/mcp`, bound to `127.0.0.1:8765` by default. Every
-request carries a bearer token, and the `Origin` and `Host` checks run alongside
-it. The token comes from `$VIBREV_HOME/token`, falling back to `~/.vibrev/token`,
+request carries a bearer token. Origin headers are not validated; the optional
+Host check runs alongside bearer authentication. The token comes from `$VIBREV_HOME/token`, falling back to `~/.vibrev/token`,
 created `0600` on first use and reused afterwards; `--token-file` points
 elsewhere.
 
@@ -240,6 +240,64 @@ to.
 ```json
 { "command": "bn-headless-mcp", "args": ["serve", "--mode", "stdio"] }
 ```
+
+### Connecting Grok
+
+For the local Grok CLI, use stdio — it launches the server on the same machine,
+so no port, token, or tunnel is involved. The `--mode stdio` is required because
+the bare command defaults to HTTP and waits on a socket instead of reading the
+MCP pipe:
+
+```bash
+grok mcp add bn-headless-mcp -- bn-headless-mcp serve --mode stdio
+grok mcp doctor bn-headless-mcp --debug
+```
+
+Grok CLI can also use the local HTTP listener directly. In that case the URL must
+include `/mcp`, and the bearer header is mandatory:
+
+```bash
+token="$(sed -n '/^[[:space:]]*vbr_/ { s/[[:space:]].*$//; p; q; }' ~/.vibrev/token)"
+grok mcp add --transport http bn-headless-mcp \
+  http://127.0.0.1:8765/mcp \
+  --header "Authorization: Bearer ${token}"
+grok mcp doctor bn-headless-mcp --debug
+```
+
+Grok's cloud-side/custom-connector MCP cannot reach `127.0.0.1` or another
+private address. Give it a public HTTPS URL from a tunnel, and pass the same
+bearer token the listener requires. For a Cloudflare Quick Tunnel:
+
+```bash
+# Terminal 1: keep the MCP server running.
+bn-headless-mcp serve --mode http --bind 127.0.0.1:8765
+
+# Terminal 2: copy the https://…trycloudflare.com URL printed by this command.
+# Rewriting the Host header keeps bn-headless-mcp's optional Host check on.
+cloudflared tunnel --url http://127.0.0.1:8765 \
+  --http-host-header localhost:8765
+```
+
+Add `https://…trycloudflare.com/mcp` as a custom MCP connector in Grok and set
+the header to `Authorization: Bearer <token>`. The token is the first non-comment
+line in `~/.vibrev/token` (or the file selected with `--token-file`):
+
+```bash
+token="$(sed -n '/^[[:space:]]*vbr_/ { s/[[:space:]].*$//; p; q; }' ~/.vibrev/token)"
+grok mcp add --transport http bn-headless-mcp \
+  'https://<your-tunnel-host>/mcp' \
+  --header "Authorization: Bearer ${token}"
+grok mcp doctor bn-headless-mcp --debug
+```
+
+If the tunnel cannot rewrite the origin Host header, start the listener with an
+explicit host allowlist instead, for example
+`--allow-host <your-tunnel-host>`. `--allow-host '*'` also works but disables the
+Host check and should only be used when that trade-off is intended.
+
+Cloudflare Quick Tunnel URLs are temporary; after restarting the tunnel, update
+the Grok connector URL. Keep both the listener and the tunnel process running
+while Grok uses the tools.
 
 The listener flags live on `serve` in both modes, so under `--mode stdio` they
 parse and cannot be honoured. They are **refused rather than ignored**:

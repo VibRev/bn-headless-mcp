@@ -117,7 +117,7 @@ enum ServeMode {
 /// child databases here and needs flags to size it; this engine holds one view
 /// per worker process and has no pool, so there is no knob to expose.
 ///
-/// The listener knobs — bind, token, Origin/Host, framing, body cap — are not
+/// The listener knobs — bind, token, Host, framing, body cap — are not
 /// here either. They belong to `vibrev_kit::transport::HttpOptions`, which
 /// [`cli_command`] hangs on this same subcommand as plain `Arg`s, so that this
 /// engine and `ida-headless-mcp` cannot spell `--bind` two ways.
@@ -372,7 +372,7 @@ fn exposure(policy: &ToolPolicy) -> vibrev_kit::transport::Exposure {
 ///
 /// Same server, same policy, same catalogue as [`run_supervisor_stdio`] — only the
 /// transport differs, and the transport is entirely `vibrev_kit::transport`.
-/// Note what is absent: no bind loop, no token handling, no `Origin`/`Host`
+/// Note what is absent: no bind loop, no token handling, no `Host`
 /// check, and no `.layer(...)` on the router. The kit takes the router and puts
 /// the gate over all of it, so a route added here later cannot be left
 /// unguarded by forgetting a line at this call site.
@@ -711,7 +711,6 @@ mod tests {
         let fallback = vibrev_kit::transport::HttpOptions::default();
         assert_eq!(parsed.bind, fallback.bind);
         assert_eq!(parsed.bind.to_string(), "127.0.0.1:8765");
-        assert_eq!(parsed.allow_origin, fallback.allow_origin);
         assert_eq!(parsed.allow_host, fallback.allow_host);
         assert_eq!(parsed.token_file, fallback.token_file);
         assert_eq!(parsed.sse_keep_alive_secs, fallback.sse_keep_alive_secs);
