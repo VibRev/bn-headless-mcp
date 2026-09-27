@@ -106,11 +106,14 @@ serializable and as `repr()` when it is not. `print()` is captured into
 `stdout`. The interpreter is one long-lived console, so names persist between
 calls — `script.reset` clears them.
 
-> **This process speaks MCP over its real stdout.** `print()` is safe: Binary
-> Ninja replaces `sys.stdout` with a writer that feeds the output listener, and
-> nothing reaches file descriptor 1. `os.write(1, ...)` and `sys.__stdout__` are
-> not safe — they write into the JSON-RPC stream and end the session. There is
-> no way to prevent that from inside the process.
+> **A worker speaks MCP on a descriptor nothing else can reach.** Before Binary
+> Ninja initializes, the worker moves its real stdout to a private descriptor
+> and points file descriptor 1 at stderr. `print()` is captured as above;
+> `os.write(1, ...)`, `sys.__stdout__`, and a native plugin's `printf` all land on
+> stderr — relayed by the supervisor — instead of in the JSON-RPC stream. The
+> `tool` CLI does the same, so its stdout stays exactly the answer. [Measured]
+> without this, a plugin that printed one line without a newline hung
+> `session.open` forever: the corrupted response never parsed.
 
 There is no permission layer around this tool and it is advertised by default;
 see [The trust boundary](#the-trust-boundary) for why, and for how to say no.
@@ -201,8 +204,8 @@ export BN_LICENSE="$(cat ~/bn-license.txt)"  # or put license.dat in the BN user
 ```
 
 `doctor` reports the pinned API commit, whether a license can be found and where
-it came from. It initializes nothing, so it still answers on a machine that could
-not actually open a binary.
+it came from, and which plugins a worker would load. It initializes nothing, so
+it still answers on a machine that could not actually open a binary.
 
 > On Linux, Binary Ninja ships `libbinaryninjacore.so.1` and no unversioned
 > `.so`. `binaryninjacore-sys` creates the symlink itself, which means the build
@@ -343,6 +346,49 @@ patch tools and zero callable ones.
 **The default advertises everything**, `script.python` included. Withholding a
 capability the engine plainly ships means an operator discovers it through "why
 does this not work", and `--exclude-tools` is already the way to say no.
+
+### Plugins
+
+A worker loads Binary Ninja's bundled plugins and nothing else unless told
+otherwise. Two global flags change that, honoured by `serve`, `worker` and `tool`
+alike:
+
+| | |
+|---|---|
+| `--plugin <PATH>` | Load this native plugin (`.so` / `.dylib`) into every worker. Repeatable, loaded in the order given |
+| `--user-plugins` | Also load Binary Ninja's user plugin directory, the way the GUI does |
+
+```console
+$ bn-headless-mcp serve --mode stdio --plugin ~/plugins/libmy_arch.so
+$ bn-headless-mcp tool binary survey --input ./target.data --plugin ~/plugins/libmy_arch.so
+```
+
+**Loaded before the binary, not after.** An architecture plugin registers its
+architecture, its view type and usually an analysis workflow in
+`CorePluginInit`, and all three have to exist before the load picks a view type
+and runs the first analysis pass. So a worker initializes the core, loads each
+`--plugin`, and only then opens the file. [Measured] a file whose architecture
+exists only as a plugin opens as a meaningless x86 `Mapped` view without it, and
+as a view of its real architecture, with its functions found, with it.
+
+**Built for this core, or refused.** Binary Ninja has no call that loads one named
+plugin, so `--plugin` does what the core's own loader does: `dlopen`, check
+`CorePluginABIVersion` against the core's accepted window, call `CorePluginInit`.
+A plugin built for another core is refused before any of its code runs, with
+both ABI numbers and the API revision to rebuild against. For a Rust plugin that
+means pinning the `binaryninja` crate to the revision in
+[Version pinning](#version-pinning).
+
+**Operator-level, never a tool parameter.** Loading a plugin runs its code; a
+`session.open` that accepted a plugin path would hand every token holder a way to
+run native code of their choosing. The set is fixed when the process starts, the
+supervisor hands it to every worker, and `session.open` keeps reusing a view by
+path alone because every view in the table was loaded the same way.
+
+Paths are resolved once, where they were typed: `serve` refuses a missing
+plugin before it binds a port. What the core logs — including a plugin that
+failed to initialize — now reaches the worker's stderr at warning level and
+above; `RUST_LOG=binaryninja=info` shows every plugin the core loads.
 
 ---
 
@@ -559,8 +605,8 @@ reporting `complete: true`. The database is a fixed point; the raw file is not.
 ## Testing
 
 ```bash
-cargo test --bins            # 54 unit tests; no Binary Ninja needed
-cargo test --test two_paths  # 15 end-to-end tests; needs Binary Ninja + a license
+cargo test --bins            # 66 unit tests; no Binary Ninja needed
+cargo test --test two_paths  # 18 end-to-end tests; needs Binary Ninja + a license
 ```
 
 The end-to-end tests **skip with a printed reason** when no license is found,
@@ -575,8 +621,11 @@ one analysis renders identically through two paths — not that two analyses rea
 the same conclusion, which is not true and should not be tested.
 
 The suite also runs **one at a time**, behind a mutex. That is a resource
-decision, not a correctness one: fifteen tests each starting a headless Binary
+decision, not a correctness one: eighteen tests each starting a headless Binary
 Ninja is more than one machine takes.
+
+The two plugin tests build a one-file C plugin with the system `cc` and skip,
+printing why, when there is none.
 
 Gates: `cargo fmt --check` and
 `cargo clippy --all-targets --no-deps -- -D warnings` are both clean.
@@ -595,8 +644,13 @@ Gates: `cargo fmt --check` and
   patching run if you need to get back to a specific point.
 * **`session.list` cannot see other processes.** Each `serve` owns its own table;
   a cross-process registry would need a daemon, and there is none.
-* **A Python script can end the session.** `print()` is safe; writing to file
-  descriptor 1 directly is not. See [Python](#python) above.
+* **A plugin loaded by path cannot have its dependencies honoured.**
+  `CorePluginDependencies` is a request to the core's own loader, which is not
+  the one running. Bundled plugins and earlier `--plugin` entries are loaded
+  first; anything else a plugin depends on is not, and a warning says so.
+* **A plugin that fails to load fails `session.open`, not the supervisor.** The
+  caller is told the worker did not start; the reason is on the supervisor's
+  stderr, tagged with the view.
 * **`script.python` is not cancellable mid-core-call.** The timeout raises
   `KeyboardInterrupt`, which Python delivers between bytecodes — a call blocked
   inside Binary Ninja's core does not notice it until that call returns.

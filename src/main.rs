@@ -17,7 +17,7 @@
 //!
 //! `doctor` reports whether this machine can run any of them.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -29,8 +29,10 @@ use tracing_subscriber::EnvFilter;
 
 mod bn;
 mod error;
+mod plugins;
 mod policy;
 mod server;
+mod stdout;
 mod supervisor;
 // Test-only: the tool-surface contract this engine is checked against, not
 // something it implements. See `src/surface.rs`.
@@ -38,6 +40,7 @@ mod supervisor;
 mod surface;
 
 use bn::Engine;
+use plugins::PluginSet;
 use server::BnMcpServer;
 use supervisor::Supervisor;
 use vibrev_kit::output::{Capped, OutputCache};
@@ -215,6 +218,10 @@ fn cli_command() -> clap::Command {
         // `global(true)`, which is what puts their values in the leaf matches
         // `cli::resolve` returns — the `tool` path never parses this root.
         .args(vibrev_kit::policy::PolicyArgs::args())
+        // Global for the same reason, and on this root rather than on `serve`:
+        // `serve` hands them to every worker it spawns, `worker` is the process
+        // that loads them, and `tool` loads a view of its own.
+        .args(PluginSet::args())
         // Not global, unlike the policy flags: `--bind` means nothing to
         // `worker` or `tool`, so it hangs on `serve`, the only command that can
         // listen. Note "can": `serve` also has `--mode stdio`, which cannot
@@ -240,8 +247,12 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(
+            // `binaryninja` is the core's own log, forwarded by
+            // `bn::plugins::forward_core_log`. Warnings and up by default: that
+            // is where a plugin that failed to load, or a view type that refused
+            // the file, shows up, and the core's info level is chatty.
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("bn_headless_mcp=info")),
+                .unwrap_or_else(|_| EnvFilter::new("bn_headless_mcp=info,binaryninja=warn")),
         )
         .init();
 
@@ -249,8 +260,9 @@ fn main() -> anyhow::Result<()> {
     // Read before the `resolve` early-return, because that branch never reaches
     // `Cli::from_arg_matches` and the flags are global on every level.
     let selection = vibrev_kit::policy::PolicyArgs::read(&matches);
+    let plugin_set = PluginSet::read(&matches);
     if let Some((name, leaf)) = vibrev_kit::cli::resolve(&matches) {
-        return run_tool(name, leaf, &selection);
+        return run_tool(name, leaf, &selection, plugin_set);
     }
 
     let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
@@ -283,18 +295,18 @@ fn main() -> anyhow::Result<()> {
                         // decision.
                         None => vibrev_kit::transport::HttpOptions::default(),
                     };
-                    runtime.block_on(run_supervisor_http(&selection, &http))
+                    runtime.block_on(run_supervisor_http(&selection, &http, plugin_set))
                 }
                 // Before the transport comes up, not after: a refused flag
                 // should cost nothing and leave nothing running.
                 ServeMode::Stdio => {
                     reject_listener_flags_on_stdio(serve)?;
-                    runtime.block_on(run_supervisor_stdio(&selection))
+                    runtime.block_on(run_supervisor_stdio(&selection, plugin_set))
                 }
             }
         }
-        Command::Worker(args) => runtime.block_on(run_worker(&args.input, &selection)),
-        Command::Doctor => doctor(),
+        Command::Worker(args) => runtime.block_on(run_worker(&args.input, &selection, plugin_set)),
+        Command::Doctor => doctor(&plugin_set),
     }
 }
 
@@ -316,8 +328,8 @@ fn announce<T: vibrev_kit::Advertised + Clone>(policy: &ToolPolicy, catalog: &[T
     );
 }
 
-async fn run_supervisor_stdio(selection: &PolicyArgs) -> anyhow::Result<()> {
-    let supervisor = Supervisor::new()?;
+async fn run_supervisor_stdio(selection: &PolicyArgs, plugins: PluginSet) -> anyhow::Result<()> {
+    let supervisor = Supervisor::new(supervisor_plugins(plugins)?)?;
     // Built against the supervisor's own catalog, which carries the four
     // `session.*` primitives the worker face does not have.
     let catalog = supervisor::supervisor_tools();
@@ -334,6 +346,19 @@ async fn run_supervisor_stdio(selection: &PolicyArgs) -> anyhow::Result<()> {
     // Every worker dies with this process: the session table drops, each
     // `RunningService` drops, and `kill_on_drop` finishes the job.
     Ok(())
+}
+
+/// Resolve the plugin set a supervisor hands its workers, and say what it is.
+///
+/// Said on stderr for the reason [`announce`] says a narrowed policy: an
+/// operator whose tools answer differently from a stock Binary Ninja should be
+/// able to read why at the top of the log.
+fn supervisor_plugins(plugins: PluginSet) -> anyhow::Result<PluginSet> {
+    let plugins = plugins.resolve()?;
+    if !plugins.is_default() {
+        tracing::info!("every worker loads {}", plugins.describe());
+    }
+    Ok(plugins)
 }
 
 /// What a caller holding the token reaches through this port.
@@ -379,10 +404,14 @@ fn exposure(policy: &ToolPolicy) -> vibrev_kit::transport::Exposure {
 async fn run_supervisor_http(
     selection: &PolicyArgs,
     http: &vibrev_kit::transport::HttpOptions,
+    plugins: PluginSet,
 ) -> anyhow::Result<()> {
     let catalog = supervisor::supervisor_tools();
     let policy = Arc::new(policy::build(&catalog, selection)?);
     announce(&policy, &catalog);
+    // Before the bind, like the policy: a misspelled plugin path should cost
+    // nothing and leave no port open.
+    let plugins = supervisor_plugins(plugins)?;
 
     // Establishes the credential before it binds: a token file we cannot read is
     // fatal, and doing it the other way round would leave a port open while the
@@ -396,7 +425,7 @@ async fn run_supervisor_http(
         eprintln!(" {note}");
     }
 
-    let supervisor = Supervisor::new()?;
+    let supervisor = Supervisor::new(plugins)?;
     let sessions = vibrev_kit::transport::session_manager(http.session_keep_alive_secs);
     let config = listener.config().clone();
     let factory = supervisor.clone();
@@ -418,7 +447,12 @@ async fn run_supervisor_http(
     Ok(())
 }
 
-async fn run_worker(input: &str, selection: &PolicyArgs) -> anyhow::Result<()> {
+async fn run_worker(input: &str, selection: &PolicyArgs, plugins: PluginSet) -> anyhow::Result<()> {
+    // First, before Binary Ninja or any plugin can write to fd 1: from here on
+    // the JSON-RPC stream is `rpc_out` and nothing else. See `src/stdout.rs`.
+    let rpc_out = stdout::reserve()?;
+    let plugins = plugins.resolve()?;
+
     // The policy is built before the binary is opened: a selection that cannot
     // be satisfied should fail in milliseconds, not after a full analysis pass.
     //
@@ -433,7 +467,7 @@ async fn run_worker(input: &str, selection: &PolicyArgs) -> anyhow::Result<()> {
     // Load before the transport comes up. A worker that cannot open its binary
     // must fail visibly here rather than accept an `initialize` and then answer
     // every call with the same error.
-    let engine = Arc::new(Engine::open(input)?);
+    let engine = Arc::new(Engine::open(input, &plugins)?);
     // The output net goes here rather than on the supervisor, for two reasons.
     // The supervisor forwards a worker's `CallToolResult` verbatim and that is a
     // guarantee worth keeping; and this is where an oversized answer is
@@ -448,7 +482,7 @@ async fn run_worker(input: &str, selection: &PolicyArgs) -> anyhow::Result<()> {
         Governed::new(BnMcpServer::new(engine), Arc::new(policy)),
         outputs,
     )
-    .serve(stdio())
+    .serve((tokio::io::stdin(), tokio::fs::File::from_std(rpc_out)))
     .await?;
     service.waiting().await?;
     Ok(())
@@ -464,7 +498,12 @@ async fn run_worker(input: &str, selection: &PolicyArgs) -> anyhow::Result<()> {
 /// There is no output cap on this path, unlike `worker`: the answer goes into a
 /// pipe, not into a model's context window, so truncating it here would answer a
 /// question nobody asked.
-fn run_tool(name: String, leaf: &clap::ArgMatches, selection: &PolicyArgs) -> anyhow::Result<()> {
+fn run_tool(
+    name: String,
+    leaf: &clap::ArgMatches,
+    selection: &PolicyArgs,
+    plugins: PluginSet,
+) -> anyhow::Result<()> {
     let defs = BnMcpServer::vibrev_tool_defs();
     let Some(def) = defs.iter().find(|d| d.name() == name) else {
         anyhow::bail!("unknown tool: {name}");
@@ -507,11 +546,18 @@ fn run_tool(name: String, leaf: &clap::ArgMatches, selection: &PolicyArgs) -> an
     };
     let as_json = leaf.get_flag("__json");
 
+    // The answer is the only thing that may reach stdout, and it is what a
+    // caller pipes into a file — so it goes through the reserved descriptor,
+    // and whatever the core or a plugin prints goes to stderr instead. Taken
+    // before the engine opens, which is where foreign code starts running.
+    let mut answer_out = stdout::reserve()?;
+    let plugins = plugins.resolve()?;
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let code = runtime.block_on(async move {
-        let engine = Arc::new(Engine::open(&session.target)?);
+        let engine = Arc::new(Engine::open(&session.target, &plugins)?);
         let server = BnMcpServer::new(engine);
         // The same body `tools/call` reaches, converted by the same
         // `IntoCallToolResult` the router uses — so `outcome.text` is not a
@@ -531,7 +577,7 @@ fn run_tool(name: String, leaf: &clap::ArgMatches, selection: &PolicyArgs) -> an
             eprintln!("{text}");
             return Ok::<i32, anyhow::Error>(1);
         }
-        println!("{text}");
+        writeln!(answer_out, "{text}")?;
         Ok(0)
     })?;
     std::process::exit(code);
@@ -542,7 +588,7 @@ fn run_tool(name: String, leaf: &clap::ArgMatches, selection: &PolicyArgs) -> an
 /// Distribution is source-only (see README), so the failure modes are all
 /// environmental: no `BINARYNINJADIR`, no license, wrong edition. Each line says
 /// what to do about it rather than only what is wrong.
-fn doctor() -> anyhow::Result<()> {
+fn doctor(plugins: &PluginSet) -> anyhow::Result<()> {
     println!("bn-headless-mcp {}", env!("CARGO_PKG_VERSION"));
     println!(
         "built against Binary Ninja API commit {}",
@@ -567,6 +613,24 @@ fn doctor() -> anyhow::Result<()> {
              BN_LICENSE=\"$(cat ~/bn-license.txt)\"`), or put license.dat in the Binary \
              Ninja user directory."
         ),
+    }
+    // Checked for existence only. Loading one would run its initializers
+    // against a core doctor has deliberately not initialized.
+    match plugins.clone().resolve() {
+        Ok(resolved) => println!("plugins: {}", resolved.describe()),
+        Err(e) => println!("plugins: {e}"),
+    }
+    match binaryninja::user_plugin_directory() {
+        Ok(dir) => println!(
+            "user plugin directory: {} ({})",
+            dir.display(),
+            if plugins.user_plugins {
+                "loaded: --user-plugins"
+            } else {
+                "not loaded without --user-plugins"
+            }
+        ),
+        Err(()) => println!("user plugin directory: unknown"),
     }
     println!("max concurrent calls per view: {}", bn::MAX_INFLIGHT);
     println!("tools: {}", supervisor::supervisor_tools().len());

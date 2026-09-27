@@ -66,13 +66,24 @@ serde = { version = "1", features = ["derive"] }
 # crate in this build emits.
 serde_json = "1"
 clap = { version = "4.6", features = ["derive", "string"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "net", "process", "signal", "sync", "time"] }
+# `fs` for one thing: the worker's JSON-RPC stream is written through a
+# `tokio::fs::File` over a private duplicate of fd 1, not through
+# `tokio::io::stdout()` — see `src/stdout.rs`.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "fs", "net", "process", "signal", "sync", "time"] }
 # `CancellationToken`, and only that. `vibrev_kit::tasks` registers one per
 # background task and the registry deliberately keeps no `JoinHandle` — aborting
 # a tokio task cannot interrupt a thread parked inside Binary Ninja's core, so
 # cancellation is cooperative and the token is the whole mechanism.
 tokio-util = "0.7"
 anyhow = "1"
+# `--plugin <PATH>`: Binary Ninja's C API has no "load this one plugin" call —
+# only `BNInitPlugins`, which walks whole directories — so a native plugin named
+# by path is `dlopen`ed here and its `CorePluginInit` called directly, the same
+# two symbols the core's own loader looks for. See `src/bn/plugins.rs`.
+libloading = "0.8"
+# `dup`/`dup2`, and nothing else: moving fd 1 out of the way of native code that
+# writes to it. See `src/stdout.rs`.
+libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

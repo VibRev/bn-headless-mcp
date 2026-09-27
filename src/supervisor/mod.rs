@@ -53,6 +53,7 @@ use vibrev_kit::tasks::{peer_can_hold_task_handle, TaskHost, TaskOwner, TaskRegi
 
 use crate::bn::MAX_INFLIGHT;
 use crate::error::ToolError;
+use crate::plugins::PluginSet;
 use crate::server::{responses, BnMcpServer};
 
 mod tasks;
@@ -248,6 +249,10 @@ pub struct Supervisor {
     /// pay 1.6 s of Binary Ninja startup for a view one of them will discard.
     open_lock: Arc<Mutex<()>>,
     worker_exe: std::path::PathBuf,
+    /// Handed to every worker this supervisor spawns, so every view in one
+    /// session table was loaded with the same plugins — which is what lets
+    /// `session.open` keep reusing a view by path alone.
+    plugins: Arc<PluginSet>,
     idle_ttl: IdleTtl,
     /// Shared by every clone, so the HTTP face's per-session (and per-request)
     /// handlers all read one table.
@@ -269,12 +274,15 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new() -> anyhow::Result<Self> {
+    /// `plugins` should already be resolved (`PluginSet::resolve`): a worker
+    /// runs with this process's working directory, not the operator's shell.
+    pub fn new(plugins: PluginSet) -> anyhow::Result<Self> {
         let supervisor = Self {
             views: Arc::new(RwLock::new(BTreeMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             open_lock: Arc::new(Mutex::new(())),
             worker_exe: std::env::current_exe()?,
+            plugins: Arc::new(plugins),
             idle_ttl: IdleTtl::from_env(),
             tasks: TaskRegistry::new(),
             lifetime: CancellationToken::new(),
@@ -372,12 +380,7 @@ impl Supervisor {
         }
 
         let id = format!("bnv_{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let mut cmd = tokio::process::Command::new(&self.worker_exe);
-        cmd.arg("worker").arg("--input").arg(&canonical);
-        // The supervisor's lifetime is the client's, and a worker outliving it
-        // would hold a Binary Ninja license and a few hundred MB with nobody to
-        // talk to.
-        cmd.kill_on_drop(true);
+        let cmd = self.worker_command(&canonical);
 
         let (transport, stderr) = TokioChildProcess::builder(cmd)
             .stderr(Stdio::piped())
@@ -392,9 +395,14 @@ impl Supervisor {
         // is where a bad path or a missing license surfaces — with the worker's
         // own stderr already on ours.
         let service = ().serve(transport).await.map_err(|e| {
+            let usual = if self.plugins.is_default() {
+                "a missing BN_LICENSE is the usual cause"
+            } else {
+                "a missing BN_LICENSE, or a plugin that failed to load, is the usual cause"
+            };
             ToolError::Worker(format!(
                 "worker for {canonical} did not start: {e}. Its stderr is on this process's \
-                 stderr; a missing BN_LICENSE is the usual cause."
+                 stderr; {usual}."
             ))
         })?;
 
@@ -421,6 +429,18 @@ impl Supervisor {
                       update_analysis_and_wait, so the first answer is the converged one."
                 .to_owned(),
         })
+    }
+
+    /// The command line of the worker that will hold `canonical`.
+    fn worker_command(&self, canonical: &str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.worker_exe);
+        cmd.arg("worker").arg("--input").arg(canonical);
+        cmd.args(self.plugins.worker_args());
+        // The supervisor's lifetime is the client's, and a worker outliving it
+        // would hold a Binary Ninja license and a few hundred MB with nobody to
+        // talk to.
+        cmd.kill_on_drop(true);
+        cmd
     }
 
     async fn list(&self) -> responses::ViewList {
@@ -1175,5 +1195,43 @@ mod tests {
         assert_eq!(IdleTtl::ENV, "BN_IDLE_TTL_SECS");
         assert!(IdleTtl::from_secs(0).disabled());
         assert!(!IdleTtl::DEFAULT.disabled());
+    }
+
+    /// The worker is the process that loads plugins, so the supervisor has to
+    /// hand them on — unlike its policy flags, which govern routed calls here
+    /// and are deliberately not passed down.
+    #[tokio::test]
+    async fn every_worker_is_spawned_with_the_supervisors_plugins() {
+        let plugins = PluginSet {
+            user_plugins: true,
+            native: vec![std::path::PathBuf::from("/opt/plugins/libexample_arch.so")],
+        };
+        let supervisor = Supervisor::new(plugins).expect("a supervisor");
+        let cmd = supervisor.worker_command("/bin/cat");
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "worker",
+                "--input",
+                "/bin/cat",
+                "--plugin",
+                "/opt/plugins/libexample_arch.so",
+                "--user-plugins"
+            ]
+        );
+
+        let bare = Supervisor::new(PluginSet::default()).expect("a supervisor");
+        let args: Vec<String> = bare
+            .worker_command("/bin/cat")
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["worker", "--input", "/bin/cat"]);
     }
 }

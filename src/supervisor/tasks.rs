@@ -404,6 +404,7 @@ pub(super) fn background_property(what_it_defers: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::PluginSet;
     use rmcp::model::{ClientCapabilities, ProtocolVersion};
     use vibrev_kit::tasks::task_id_from_call_tool_result;
 
@@ -489,7 +490,7 @@ mod tests {
     /// an incomplete `_meta` says nothing about how a request was dispatched.
     #[tokio::test]
     async fn the_owner_follows_the_face_and_never_the_request_metadata() {
-        let stdio = Supervisor::new().expect("a supervisor");
+        let stdio = Supervisor::new(PluginSet::default()).expect("a supervisor");
         let http = stdio.http_face();
 
         for meta in [complete_meta(), RequestMetaObject::new()] {
@@ -511,7 +512,7 @@ mod tests {
     /// process had just issued.
     #[tokio::test]
     async fn every_http_connection_reads_one_registry() {
-        let base = Supervisor::new().expect("a supervisor");
+        let base = Supervisor::new(PluginSet::default()).expect("a supervisor");
         let one = base.http_face();
         let two = base.http_face();
 

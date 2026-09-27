@@ -38,9 +38,11 @@ use binaryninjacore_sys::BNAnalysisState;
 use tokio::sync::Semaphore;
 
 use crate::error::ToolError;
+use crate::plugins::PluginSet;
 
 pub mod disasm;
 pub mod patch;
+pub mod plugins;
 pub mod pseudo_c;
 pub mod read;
 pub mod script;
@@ -110,24 +112,36 @@ impl Engine {
     /// `update_analysis_and_wait = true` on the load does two jobs: it sidesteps
     /// #8165 (analysis wedging when driven incrementally), and it means the first
     /// answer this process gives is already the converged one.
-    pub fn open(path: &str) -> Result<Self, ToolError> {
+    ///
+    /// `plugins` beyond the bundled set are loaded between initialization and
+    /// the load, because what a plugin registers — an architecture, a view type,
+    /// a workflow — has to exist before the load picks a view type and runs the
+    /// first analysis pass. See [`plugins`].
+    pub fn open(path: &str, plugins: &PluginSet) -> Result<Self, ToolError> {
         if !Path::new(path).exists() {
             return Err(ToolError::InvalidParams(format!(
                 "no such file: {path} (bn-headless-mcp opens a binary or a .bndb by path)"
             )));
         }
 
+        plugins::forward_core_log();
+
         // `Session::new()` refuses when it cannot locate a license, but its error
         // does not say where it looked. Say it here instead: a missing BN_LICENSE
         // is the single most common way this engine fails to start, and headless
         // needs Commercial or Ultimate.
-        let session = Session::new_with_opts(InitializationOptions::default()).map_err(|e| {
+        let options = InitializationOptions::default().with_user_plugins(plugins.user_plugins);
+        let session = Session::new_with_opts(options).map_err(|e| {
             ToolError::Bn(format!(
                 "Binary Ninja initialization failed: {e}. Headless operation needs a \
                  Commercial or Ultimate license; set BN_LICENSE to the license text, or \
                  put license.dat in the Binary Ninja user directory."
             ))
         })?;
+
+        for plugin in &plugins.native {
+            plugins::load_native(plugin)?;
+        }
 
         // ⚠ `options` must be `Some`, never `None`. In this pinned revision the
         // `None` branch of `load_with_options_and_progress` builds its default

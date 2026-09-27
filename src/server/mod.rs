@@ -2765,9 +2765,10 @@ impl BnMcpServer {
     /// The interpreter is one long-lived console, so names defined by one call
     /// are still there in the next — use `script.reset` to start clean.
     ///
-    /// Two limits worth knowing before writing the script. **This process speaks
-    /// MCP over its real stdout**, so `print()` is safe but `os.write(1, ...)`
-    /// and `sys.__stdout__` corrupt the session. And a script that outlives
+    /// Output written around `print()` — `os.write(1, ...)`, `sys.__stdout__` —
+    /// is not captured: it goes to the worker's stderr, not into `stdout` here.
+    ///
+    /// One limit worth knowing before writing the script: a script that outlives
     /// `timeout_secs` is interrupted with `KeyboardInterrupt`, which Python
     /// delivers between bytecodes — a call blocked inside Binary Ninja's core
     /// will not notice it until that call returns.

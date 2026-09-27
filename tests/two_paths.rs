@@ -1177,6 +1177,230 @@ async fn a_failing_script_reports_the_traceback_rather_than_erroring_out() {
     worker.cancel().await.ok();
 }
 
+/// Await `call`, or fail naming `what` after two minutes.
+///
+/// For the calls a leaked write to fd 1 would corrupt. A corrupted JSON-RPC
+/// message is not an error the client reports — it is a response that never
+/// parses, so the request waits forever. [Measured] with the fd 1 handoff
+/// disabled, these tests hung instead of failing; a regression test that hangs
+/// reads as a stuck CI job rather than as the regression it caught.
+async fn within<T>(what: &str, call: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(120), call)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{what} never answered: a write to fd 1 probably corrupted the protocol stream")
+        })
+}
+
+/// A write to file descriptor 1 from inside the process — `os.write(1, ...)`,
+/// `sys.__stdout__` — lands on stderr, not in the protocol stream.
+///
+/// Without a trailing newline on purpose: that is the shape that cannot be
+/// skipped as a stray line, because it glues itself onto the front of the next
+/// JSON-RPC message. Both front ends are checked — the worker has to keep
+/// answering, and the CLI's stdout has to stay exactly the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_writes_to_fd1_do_not_reach_the_protocol_stream() {
+    let _serial = exclusive().await;
+    let Some(input) = requirements() else { return };
+    const SCRIPT: &str = "import os, sys\n\
+                          os.write(1, b'raw-fd1-without-newline')\n\
+                          sys.__stdout__.write('dunder-stdout-without-newline')\n\
+                          sys.__stdout__.flush()\n\
+                          result = 42\n";
+
+    let transport =
+        TokioChildProcess::new(spawn(&["worker", "--input", &input])).expect("spawn worker");
+    let worker = ().serve(transport).await.expect("worker initialize");
+    let ran = within(
+        "script.python",
+        worker.peer().call_tool(
+            CallToolRequestParams::new("script.python")
+                .with_arguments(object(json!({"source": SCRIPT}))),
+        ),
+    )
+    .await
+    .expect("script.python")
+    .structured_content
+    .expect("structuredContent");
+    assert_eq!(ran.get("result"), Some(&json!(42)), "{ran:?}");
+    // The next message is the one a leaked write would have corrupted.
+    let after = within(
+        "binary.segments after raw writes",
+        worker
+            .peer()
+            .call_tool(CallToolRequestParams::new("binary.segments")),
+    )
+    .await
+    .expect("the worker still answers after raw writes to fd 1");
+    assert_ne!(after.is_error, Some(true), "{after:?}");
+    worker.cancel().await.ok();
+
+    let printed = cli(&["tool", "script", "python", SCRIPT, "--json"], &input)
+        .expect("script.python over the CLI");
+    let parsed: Value = serde_json::from_str(&printed)
+        .unwrap_or_else(|e| panic!("CLI stdout is not only the answer ({e}): {printed:?}"));
+    assert_eq!(parsed.get("result"), Some(&json!(42)));
+}
+
+/// Build a one-file native plugin with the system C compiler, or say why not.
+///
+/// Its `CorePluginInit` does the two things this suite needs to see: it appends
+/// to the file named by `BN_MCP_TEST_PLUGIN_MARKER`, proving it ran, and it
+/// `printf`s without a newline, which is what a careless plugin does to fd 1.
+/// `abi` is what it reports from `CorePluginABIVersion`.
+fn build_test_plugin(name: &str, abi: u32) -> Option<std::path::PathBuf> {
+    let scratch = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("plugins");
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let source = scratch.join(format!("{name}.c"));
+    let library = scratch.join(format!("lib{name}.so"));
+    std::fs::write(
+        &source,
+        format!(
+            "#include <stdio.h>\n#include <stdint.h>\n#include <stdbool.h>\n#include <stdlib.h>\n\
+             uint32_t CorePluginABIVersion(void) {{ return {abi}; }}\n\
+             bool CorePluginInit(void) {{\n\
+               printf(\"test-plugin-printf-without-newline\"); fflush(stdout);\n\
+               const char *m = getenv(\"BN_MCP_TEST_PLUGIN_MARKER\");\n\
+               if (m) {{ FILE *f = fopen(m, \"a\"); if (f) {{ fputs(\"init\\n\", f); fclose(f); }} }}\n\
+               return true;\n\
+             }}\n"
+        ),
+    )
+    .expect("write plugin source");
+    let compiled = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&library)
+        .arg(&source)
+        .status();
+    match compiled {
+        Ok(status) if status.success() => Some(library),
+        Ok(status) => {
+            eprintln!("SKIP: cc could not build the test plugin ({status})");
+            None
+        }
+        Err(e) => {
+            eprintln!("SKIP: no C compiler to build the test plugin with ({e})");
+            None
+        }
+    }
+}
+
+/// `--plugin` reaches the worker the supervisor spawns, the plugin initializes
+/// there, and what it prints does not reach either protocol stream.
+///
+/// What the plugin registers is not observable from C without the core's
+/// headers, so this checks the part that is the engine's to get right: the
+/// supervisor hands the flag on, the worker loads the library and runs
+/// `CorePluginInit`, and the process still speaks clean JSON-RPC afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_native_plugin_named_by_path_loads_in_every_worker() {
+    let _serial = exclusive().await;
+    let Some(input) = requirements() else { return };
+    let Some(plugin) = build_test_plugin("bn_mcp_test_plugin", 164) else {
+        return;
+    };
+    let plugin = plugin.to_string_lossy().into_owned();
+    let marker = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("plugin_marker");
+    let _ = std::fs::remove_file(&marker);
+
+    let mut cmd = spawn(&["serve", "--mode", "stdio", "--plugin", &plugin]);
+    cmd.env("BN_MCP_TEST_PLUGIN_MARKER", &marker);
+    let supervisor =
+        ().serve(TokioChildProcess::new(cmd).expect("spawn supervisor"))
+            .await
+            .expect("supervisor initialize");
+    let opened = within(
+        "session.open with a plugin that printed to fd 1",
+        supervisor.peer().call_tool(
+            CallToolRequestParams::new("session.open")
+                .with_arguments(object(json!({"path": input}))),
+        ),
+    )
+    .await
+    .expect("session.open");
+    assert_ne!(opened.is_error, Some(true), "{opened:?}");
+    let view = opened
+        .structured_content
+        .as_ref()
+        .and_then(|v| v.get("view"))
+        .and_then(Value::as_str)
+        .expect("a view handle")
+        .to_owned();
+    let segments = within(
+        "binary.segments through the plugin's worker",
+        supervisor.peer().call_tool(
+            CallToolRequestParams::new("binary.segments")
+                .with_arguments(object(json!({"view": view}))),
+        ),
+    )
+    .await
+    .expect("the worker answers after its plugin printed to fd 1");
+    assert_ne!(segments.is_error, Some(true), "{segments:?}");
+    supervisor.cancel().await.ok();
+
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("CorePluginInit ran in the worker"),
+        "init\n",
+        "the plugin initialized exactly once"
+    );
+
+    // The CLI loads it too, and its stdout is still nothing but the answer:
+    // the same bytes a run without the plugin prints.
+    let with_plugin = std::process::Command::new(EXE)
+        .args([
+            "tool", "binary", "segments", "--plugin", &plugin, "--input", &input,
+        ])
+        .env("BN_MCP_TEST_PLUGIN_MARKER", &marker)
+        .output()
+        .expect("run the CLI with --plugin");
+    assert!(with_plugin.status.success(), "{with_plugin:?}");
+    let without = cli(&["tool", "binary", "segments"], &input).expect("run the CLI without");
+    assert_eq!(
+        String::from_utf8(with_plugin.stdout)
+            .expect("utf-8")
+            .trim_end_matches('\n'),
+        without,
+        "the plugin's printf reached the CLI's answer"
+    );
+    assert!(
+        String::from_utf8_lossy(&with_plugin.stderr).contains("test-plugin-printf-without-newline"),
+        "what the plugin printed should still be somewhere an operator can read"
+    );
+}
+
+/// A plugin built for another core is refused before its code runs, and the
+/// refusal names both ABI numbers and the revision to rebuild against.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_built_for_another_core_is_refused_with_the_reason() {
+    let _serial = exclusive().await;
+    let Some(input) = requirements() else { return };
+    let Some(plugin) = build_test_plugin("bn_mcp_test_wrong_abi", 999) else {
+        return;
+    };
+    let marker = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrong_abi_marker");
+    let _ = std::fs::remove_file(&marker);
+
+    let refused = std::process::Command::new(EXE)
+        .args(["tool", "binary", "segments", "--input", &input, "--plugin"])
+        .arg(&plugin)
+        .env("BN_MCP_TEST_PLUGIN_MARKER", &marker)
+        .output()
+        .expect("run the CLI");
+    assert!(!refused.status.success(), "a wrong-ABI plugin was accepted");
+    assert!(refused.stdout.is_empty(), "a refusal printed an answer");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("core ABI 999"), "{stderr}");
+    assert!(
+        stderr.contains("aa25bfcfd36532ec3850558a58444df7727e297b"),
+        "{stderr}"
+    );
+    assert!(
+        !marker.exists(),
+        "CorePluginInit ran even though the ABI check refused the plugin"
+    );
+}
+
 /// The type write path, checked for the property that justifies it: a type
 /// written onto a function changes what `il.pseudo_c` renders.
 ///

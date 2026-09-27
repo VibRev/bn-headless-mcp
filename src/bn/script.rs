@@ -37,14 +37,14 @@
 //! every fragment and cuts the payload out. Anything the script printed is
 //! inside that JSON, not interleaved with it.
 //!
-//! # The one thing a script must not do
+//! # Output that goes around `print()`
 //!
-//! This worker speaks MCP over its real stdout. `print()` is safe — Binary Ninja
-//! replaces `sys.stdout` with a writer that feeds the listener, and [measured]
-//! nothing leaks to file descriptor 1. `os.write(1, ...)` and `sys.__stdout__`
-//! are not safe: they write straight into the JSON-RPC stream and end the
-//! session. There is no way to prevent that from inside the process, so it is
-//! documented on the tool instead.
+//! `print()` is captured — Binary Ninja replaces `sys.stdout` with a writer that
+//! feeds the listener, and [measured] nothing of it reaches file descriptor 1.
+//! `os.write(1, ...)` and `sys.__stdout__` do reach fd 1, and used to end the
+//! session by writing into the JSON-RPC stream. They no longer can: the worker
+//! moved its protocol stream off fd 1 before Binary Ninja started, and fd 1 now
+//! leads to stderr (`src/stdout.rs`). Such output is simply not captured here.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
